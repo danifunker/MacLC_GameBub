@@ -1,0 +1,520 @@
+//
+// sdram.v
+//
+// sdram controller implementation for the MiST board
+// 
+// Copyright (c) 2015 Till Harbaum <till@harbaum.org> 
+// 
+// This source file is free software: you can redistribute it and/or modify 
+// it under the terms of the GNU General Public License as published 
+// by the Free Software Foundation, either version 3 of the License, or 
+// (at your option) any later version. 
+// 
+// This source file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of 
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the 
+// GNU General Public License for more details.
+// 
+// You should have received a copy of the GNU General Public License 
+// along with this program.  If not, see <http://www.gnu.org/licenses/>. 
+//
+
+module sdram 
+(
+	// interface to the MT48LC16M16 chip
+	output              sd_clk,
+	// [gamebub] split data bus: the framework owns the pad tristate
+	output reg [15:0]   sd_data,    // controller -> chip
+	input      [15:0]   sd_data_in, // chip -> controller
+	output reg          sd_data_oe, // 1 = drive sd_data
+	output reg [12:0]   sd_addr,    // 13 bit multiplexed address bus
+	output     [1:0]    sd_dqm,     // two byte masks
+	output reg [1:0]    sd_ba,      // two banks
+	output              sd_cs,      // a single chip select
+	output              sd_we,      // write enable
+	output              sd_ras,     // row address select
+	output              sd_cas,     // columns address select
+
+	// cpu/chipset interface
+	input               init,       // init signal after FPGA config to initialize RAM
+	input               clk_64,     // sdram is accessed at 64MHz
+	input               clk_8,      // 8MHz chipset clock to which sdram state machine is synchonized
+
+	input [15:0]        din,        // data input from chipset/cpu
+	output reg [15:0]   dout,       // floppy-window read data (loaded on a clk_64 FALLING edge, see read capture)
+	input [23:0]        addr,       // 24 bit word address
+	input [1:0]         ds,         // upper/lower data strobe
+	input               oe,         // cpu/chipset requests read
+	input               we,         // cpu/chipset requests write
+
+	// ── demand-start CPU service (Phase C, branch cpu-enhancements) ────────
+	// oe/we + addr/din/ds form a LEVEL request (held while _cpuAS is low, or
+	// while a download write is presented). The sequencer starts an access at
+	// the next clk_64 edge instead of waiting for a bus-slot boundary; that
+	// removes the mod-4 slot quantization that pinned every CPU memory access
+	// to >=8 clk_sys (docs/CPU_Perf_Log.md).
+	input               flp_win,    // floppy fetch window (old slot timing, pending-gated
+	                                // in addrController): serve `flp_addr` into `dout`, priority
+	input  [23:0]       flp_addr,   // UNREGISTERED floppy address. ★ The floppy path must
+	                                // NOT take the clk_sys request pipeline: floppy.v latches
+	                                // its byte at busPhase 3 of the window slot, and delaying
+	                                // the access by the pipeline's one tick pushes the data
+	                                // capture to busPhase 0 of the NEXT slot — one tick after
+	                                // the latch, so the guest receives the PREVIOUS byte and
+	                                // the disk stream is corrupt (observed on hardware as
+	                                // illegal-instruction / coprocessor bombs after a mount).
+	                                // Bypassing is safe here: this cone is a shallow add+mux
+	                                // and the encoder holds the address stable for the whole
+	                                // window, unlike the deep V8 CPU translation the pipeline
+	                                // exists to protect.
+	input               flp_guard,  // a pending floppy window opens soon: don't START a
+	                                // CPU access that would still occupy the chip then
+
+	// ── download (HPS image write) port ────────────────────────────────────
+	// ★★★ ROOT CAUSE of the "mounting a floppy bombs the guest" regression
+	// (found 2026-08-18, branch cpu-icache). The download used to ride the
+	// CPU's own oe/we/addr/din nets, muxed in for the dioBusControl slot
+	// (`download_cycle` in MacLC.sv / verilator/sim.v). That was sound under
+	// the OLD slot machine, where _ramOE/_ramWE were gated on cpuBusControl —
+	// the exact complement of dioBusControl — so a CPU request and a download
+	// write could not coexist. Phase C (f13d936) deleted that gating to make
+	// the CPU request a LEVEL held for the whole AS-low window, and the level
+	// now spans the download's slot. Two failures followed, both fatal:
+	//   1. While the mux pointed at the download, the CPU's request was
+	//      INVISIBLE here, and the download's posted-write ack landed in
+	//      `cpu_done` — which is the CPU's DTACK. When the slot ended and the
+	//      CPU's still-asserted `oe` came back, `!(oe||we)` was never true, so
+	//      cpu_done never cleared: the CPU completed a read it had never
+	//      issued and latched the PREVIOUS access's cpu_dout. Executing that
+	//      stale word is the "illegal instruction" / "coprocessor not
+	//      installed" bomb seen on every floppy mount since Phase C.
+	//   2. In slots where dio_write was low, oe/we were forced to 0, CLEARING
+	//      a legitimate in-flight CPU cpu_done mid-access.
+	// The ROM download at boot was immune only because MacLC.sv holds the CPU
+	// in reset while (dio_download && dio_index==0) — which is why booting
+	// always worked and only mounting broke.
+	// This port restores the mutual exclusion STRUCTURALLY: the download has
+	// its own request, its own frozen address/data, and never writes cpu_done.
+	input               dl_req,     // LEVEL: a download word is pending (= ioctl_wait)
+	input               dl_slot,    // its bus slot (dioBusControl) — gating the START
+	                                // here keeps the download to one word per bus
+	                                // round, exactly the pre-Phase-C rate, so the
+	                                // CPU/download bandwidth split is unchanged
+	input  [23:0]       dl_addr,    // SDRAM word address for that word
+	input  [15:0]       dl_din,     // the word
+	output reg          dl_ack,     // LEVEL, not a pulse: clk_64 is 2x clk_sys, so a
+	                                // one-tick pulse is not reliably sampleable over
+	                                // there. Held from issue until dl_req drops, i.e.
+	                                // until the clk_sys side has seen it and cleared
+	                                // ioctl_wait. Keying the release on the SLOT
+	                                // instead would drop the ack at the slot edge and
+	                                // hang the download when the two just missed.
+
+	// ── PDS Ethernet guest-RAM DMA port (rtl/pds/pds_enet.sv, Phase 3) ─────
+	// Same discipline as the download port: its own LEVEL request with values
+	// frozen by the requester until ack, its own LEVEL ack, and it NEVER
+	// touches cpu_done/cpu_dout. Ranked LAST — it only starts on edges with
+	// no CPU request level up at all (!(oe||we); the I-cache's hit-silent
+	// bus leaves plenty), and its bandwidth need is tiny (10BASE-T peak =
+	// one word per ~1.6 us = one access per ~104 clk_64), so it cannot
+	// starve and cannot be starved in any way that matters.
+	input               eth_req,    // LEVEL: held by pds_enet until eth_ack seen
+	input               eth_we,
+	input  [23:0]       eth_addr,   // SDRAM word address (pre-translated V8 map)
+	input  [15:0]       eth_din,
+	output reg          eth_ack,    // LEVEL: read = data valid in eth_dout,
+	                                // write = posted at ACTIVE. Falls when
+	                                // eth_req drops (two-phase handshake).
+	output reg [15:0]   eth_dout,   // private read register (never dout/cpu_dout)
+
+	output reg          cpu_done,   // request served: read data will be stable in cpu_dout
+	                                // before a consumer sampling done can latch it 2 ticks
+	                                // later (early-done: set at ACTIVE+3 clk_64, cpu_dout
+	                                // loaded at ACTIVE+7); for writes set at ACTIVE (posted). Holds
+	                                // until the request level drops (AS release), so the
+	                                // CPU glue can use it as an async DTACK directly.
+	output reg [15:0]   cpu_dout    // held CPU read data (private register: floppy-window
+	                                // reads land in `dout` and can no longer clobber it)
+);
+
+localparam RASCAS_DELAY   = 3'd2;   // tRCD=20ns -> 3 cycles@128MHz
+localparam BURST_LENGTH   = 3'b000; // 000=1, 001=2, 010=4, 011=8
+localparam ACCESS_TYPE    = 1'b0;   // 0=sequential, 1=interleaved
+localparam CAS_LATENCY    = 3'd2;   // 2/3 allowed
+localparam OP_MODE        = 2'b00;  // only 00 (standard operation) allowed
+localparam NO_WRITE_BURST = 1'b1;   // 0= write burst enabled, 1=only single access write
+
+localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH}; 
+
+
+// ---------------------------------------------------------------------
+// ------------------------ cycle state machine ------------------------
+// ---------------------------------------------------------------------
+
+// The state machine runs at 128Mhz synchronous to the 8 Mhz chipset clock.
+// It wraps from T15 to T0 on the rising edge of clk_8
+
+localparam STATE_FIRST     = 3'd0;   // first state in cycle
+localparam STATE_CMD_START = 3'd0;   // state in which a new command can be started
+localparam STATE_CMD_CONT  = STATE_CMD_START  + RASCAS_DELAY; // command can be continued
+// STATE_READ = the posedge at which the consumers (cpu_dout / eth_dout) take
+// the read word. It is NOT the pin-sampling edge any more: the pins are
+// sampled by sd_data_q on the clk_64 FALLING edge STATE_CMD_CONT+CL+1.5 (see
+// the read-capture block below), re-timed once in the fabric on the next
+// falling edge, and consumed here one posedge after that. History: +1 was the
+// original, 3a6f00d made it +2 "for 65MHz margin" (setup only — the hold side
+// was left to the fitter's routing, which is the 2026-09 QuarkXPress
+// regression), 2026-09-12 made it +3 so that the pin-to-core route gets a
+// full clk_64 period instead of half of one.
+localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd3;
+localparam STATE_LAST      = 3'd7;  // last state in cycle
+
+reg [2:0] t;
+always @(posedge clk_64) begin
+	// 128Mhz counter synchronous to 8 Mhz clock
+	// force counter to pass state 0 exactly after the rising edge of clk_8
+	if(((t == STATE_LAST)  && ( clk_8 == 0)) ||
+		((t == STATE_FIRST) && ( clk_8 == 1)) ||
+		((t != STATE_LAST) && (t != STATE_FIRST)))
+			t <= t + 3'd1;
+end
+
+// ---------------------------------------------------------------------
+// --------------------------- startup/reset ---------------------------
+// ---------------------------------------------------------------------
+
+// JEDEC SDR-SDRAM init: ~118us of NOPs after the clock starts (the chip
+// wants 100us of stable clock before the first command — the FPGA was just
+// reconfigured, so the SDRAM clock was dead/floating until now), then
+// PRECHARGE ALL -> 8x AUTO REFRESH -> LOAD MODE. The previous sequence
+// (31 chipset cycles ~4us, ZERO refreshes; its "wait 1ms" comment was wrong)
+// relied on the chip state the PREVIOUS core left behind; whether the mode
+// register write took was per-load luck — suspected cause of the cold-load
+// flakiness that clears after loading a different core first.
+// The ladder is content-preserving (NOPs/refreshes/MRS only), so it is also
+// safe to re-run via `init` on a warm user reset while the ROM is in SDRAM.
+reg [9:0] reset;
+always @(posedge clk_64) begin
+	if(init)	reset <= 10'h3ff;
+	else if((t == STATE_LAST) && (reset != 0))
+		reset <= reset - 10'd1;
+end
+
+initial reset = 10'h3FF;
+initial t     = 3'd0;    // Icarus starts regs at X; Verilator/Quartus power up at 0
+
+// ---------------------------------------------------------------------
+// ------------------ generate ram control signals ---------------------
+// ---------------------------------------------------------------------
+
+// all possible commands
+localparam CMD_INHIBIT         = 4'b1111;
+localparam CMD_NOP             = 4'b0111;
+localparam CMD_ACTIVE          = 4'b0011;
+localparam CMD_READ            = 4'b0101;
+localparam CMD_WRITE           = 4'b0100;
+localparam CMD_BURST_TERMINATE = 4'b0110;
+localparam CMD_PRECHARGE       = 4'b0010;
+localparam CMD_AUTO_REFRESH    = 4'b0001;
+localparam CMD_LOAD_MODE       = 4'b0000;
+
+reg [3:0] sd_cmd;   // current command sent to sd ram
+
+// drive control signals according to current command
+assign sd_cs  = sd_cmd[3];
+assign sd_ras = sd_cmd[2];
+assign sd_cas = sd_cmd[1];
+assign sd_we  = sd_cmd[0];
+assign sd_dqm = sd_addr[12:11];
+
+reg oe_latch, we_latch;
+
+// ── Demand sequencer state (Phase C, branch cpu-enhancements) ────────────
+// One access = the same 8-clk_64 command schedule the old slot machine used
+// (ACTIVE at start, READ/WRITE+auto-precharge at STATE_CMD_CONT, pins sampled
+// on the falling edge at CL+1.5, consumed at STATE_READ) — only the START is now any
+// idle clk_64 edge instead of a bus-slot boundary. Floppy windows (flp_win)
+// take priority and still run slot-aligned by construction (the window IS
+// the old slot), so floppy.v and its fetch-freshness protocol see identical
+// timing. Refresh is explicit now that idle slots no longer auto-refresh:
+// tREF needs one AUTO_REFRESH per 7.8 us (~508 clk_64); opportunistic when
+// idle past REF_OPP, request-blocking past REF_FORCE. (The old design
+// refreshed every idle slot — orders of magnitude more than required.)
+reg [2:0]  seq;          // position within a running access (1..7; ACTIVE at start)
+reg        seq_busy;
+reg        src_cpu;      // running access belongs to the CPU (vs floppy or download):
+                         // gates cpu_done / cpu_dout, which only the CPU may touch
+reg        src_eth;      // running access belongs to the ethernet DMA engine:
+                         // gates eth_ack / eth_dout, which only it may touch
+// Request values frozen at ACTIVE, so an access that starts late — e.g.
+// delayed behind a refresh, or a download word that had to wait out a CPU
+// access — cannot see its inputs change underneath it mid-access.
+reg [15:0] din_q;
+reg [1:0]  ds_q;
+reg [8:0]  col_q;        // {addr[22], addr[7:0]} for the CAS phase
+reg        flp_served;   // this floppy window already got its access
+reg        dl_served;    // this download window already got its access
+reg        ref_busy;
+reg [2:0]  ref_cnt;
+reg [9:0]  ref_due;      // clk_64 ticks since last refresh (saturating)
+// ── served_addr / cpu_rearm REMOVED (2026-08-18) ────────────────────────────
+// They existed to re-arm a write whose `we` stayed high across two DIFFERENT
+// addresses (imagined download bursts). That case cannot occur: during a
+// download `we` is only presented inside dioBusControl slots and drops between
+// them, and CPU writes always release AS between accesses — either way
+// cpu_done clears and the next write starts on its own. The compare cost a
+// 24-bit clk_sys -> clk_64 crossing that repeatedly produced marginal HOLD
+// violations (sdram_addr_q -> served_addr, seen at -0.216 ns and -0.037 ns on
+// different placements). Deleting it removes the hazard at its source rather
+// than reseeding around it. If a download ever hangs (ioctl_wait never
+// clearing, so the ROM never loads and nothing boots), this is the first thing
+// to reconsider.
+localparam REF_OPP   = 10'd300;  // idle refresh threshold
+localparam REF_FORCE = 10'd480;  // block new CPU starts, refresh first
+
+// Read view of the data pins (alias only; the TB pin split substitutes the
+// chip model's input here — see the TB_NO_TRISTATE note at the port list).
+wire [15:0] sd_data_rd = sd_data_in;
+
+// ── Read capture (2026-09-12): two FALLING-edge stages, then the consumers.
+//
+// Timeline for one read, P = clk_64 period (15.38 ns), E_k = the k-th posedge
+// after ACTIVE (E0). SDRAM_CLK is the INVERTED clk_64 (altddio_out below), so
+// the chip's rising edges are clk_64 FALLING edges:
+//   E2      READ issued (seq == STATE_CMD_CONT); the chip latches it at E2.5
+//   E4.5    chip launches DQ (CL = 2); valid at the pin ~tAC later
+//   E5.5    sd_data_q  <= pins      I/O-cell register, clk_64 falling edge.
+//                                   Eye measured by STA (MacLC.sdc):
+//                                   +2.2 ns setup / +6.5 ns hold, identical
+//                                   to 0.04 ns across three fitter seeds.
+//   E6.5    sd_data_r  <= sd_data_q fabric register, clk_64 falling edge:
+//                                   the ~6 ns I/O-cell -> core route gets a
+//                                   FULL period (a posedge stage at E6 only
+//                                   had half of one and failed timing by
+//                                   -0.14..-0.64 ns on every seed).
+//   E7      cpu_dout / eth_dout <= sd_data_r   (seq == STATE_READ; a short
+//                                   fabric-to-fabric half-period path)
+//   The floppy word goes to `dout` at E6.5 directly from sd_data_q (gated by
+//   flp_cap): floppy.v latches its byte at busPhase 3 of the window slot,
+//   which is E7 of a window access (ACTIVE lands at slot+1), so a posedge
+//   E7 copy would arrive one clk_64 too late for it.
+//
+// Why: before this, three fabric registers (cpu_dout, eth_dout, dout) each
+// sampled the pins directly at STATE_READ. Only one register per pin packs
+// into the I/O cell, so two of them rode 3.8-12.3 ns of routing — the term a
+// fitter SEED reshuffles — and the SDRAM pins carried NO I/O constraints, so
+// STA never looked. That is how a pure reseed (SEED 8 -> 4) turned into the
+// QuarkXPress Line-1111 hang. See docs/plan_sdram_read_capture_2026-09-12.md.
+// The chip holds DQ only until its next edge + tOH (BL = 1), so the I/O-cell
+// stage is what makes the eye fit-invariant; the fabric stage is what makes
+// the hand-off close. sys/sys.tcl's FAST_INPUT_REGISTER on SDRAM_DQ[*] packs
+// sd_data_q (verify: 16 "Fast Input Register" rows in the fit report).
+reg [15:0] sd_data_q;   // I/O cell, E5.5
+reg [15:0] sd_data_r;   // fabric,   E6.5
+reg        flp_cap;     // posedge-domain enable: the E6.5 edge of a floppy read
+always @(negedge clk_64) sd_data_q <= sd_data_rd;
+always @(negedge clk_64) sd_data_r <= sd_data_q;
+always @(negedge clk_64) if (flp_cap) dout <= sd_data_q;   // floppy-window data
+
+wire req_flp   = flp_win && !flp_served;
+// Download: served in its own bus slot, at most one word per window, ranked
+// between the floppy window and the CPU. If a CPU access happens to straddle
+// the whole window the word simply waits for the next one — dl_ack, not the
+// slot edge, is what releases ioctl_wait, so no word can be silently dropped.
+wire req_dl    = dl_req && dl_slot && !dl_served;
+// t[0] parity gate: only start CPU accesses on clk_64 edges that coincide
+// with a clk_sys edge (the free-running ladder counter t wraps at the clk_8
+// boundary, so an edge evaluating an ODD t begins an even-t period = an
+// integer clk_sys tick). This pins every edge of the access to a known clk_sys
+// phase: cpu_done rises at E3 (odd) and cpu_dout lands at E7 (odd), one clk_64
+// before the clk_sys edges that consume them — exactly the single-period
+// clk_64 -> clk_sys relationship STA checks for these paths (no multicycle).
+// Costs at most one clk_64 of start latency.
+wire req_cpu   = (oe || we) && !flp_win && !flp_guard && t[0]
+                 && !cpu_done && (ref_due < REF_FORCE);
+// Ethernet DMA: strictly idle edges only — no CPU request level up at all
+// (not merely "CPU can't start this edge"), outside floppy windows/guards,
+// same t[0] parity as the CPU so eth_dout's capture edge is clk_sys-aligned
+// for its clk_sys consumer.
+wire req_eth   = eth_req && !eth_ack && !(oe || we) && !flp_win && !flp_guard
+                 && t[0] && (ref_due < REF_FORCE);
+
+always @(posedge clk_64) begin
+	sd_cmd <= CMD_INHIBIT;  // default: idle
+	sd_data_oe <= 1'b0;
+	// Floppy-window read: arm the falling-edge `dout` load for E6.5 (set at
+	// E6, i.e. when seq == STATE_READ-1 is seen; cleared again at E7).
+	flp_cap <= seq_busy && (seq == STATE_READ - 3'd1) && !src_cpu && !src_eth && oe_latch;
+
+	if(reset != 0) begin
+		seq_busy   <= 0;
+		ref_busy   <= 0;
+		ref_due    <= 0;
+		cpu_done   <= 0;
+		flp_served <= 0;
+		dl_served  <= 0;
+		dl_ack     <= 0;
+		eth_ack    <= 0;
+		src_eth    <= 0;
+		// init ladder, one command slot per chipset cycle (~123ns apart):
+		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
+		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
+		// of magnitude at this spacing.
+		if(t == STATE_CMD_START) begin
+
+			if(reset == 64) begin
+				sd_cmd <= CMD_PRECHARGE;
+				sd_addr[10] <= 1'b1;      // precharge all banks
+			end
+
+			if(reset >= 28 && reset <= 56 && reset[1:0] == 2'b00)
+				sd_cmd <= CMD_AUTO_REFRESH;
+
+			if(reset == 2) begin
+				sd_cmd <= CMD_LOAD_MODE;
+				sd_addr <= MODE;
+			end
+
+		end
+	end else begin
+		// normal operation (demand-start)
+
+		// request-level bookkeeping
+		if (!(oe || we)) cpu_done <= 0;    // AS released / request withdrawn
+		if (!flp_win)    flp_served <= 0;
+		if (!dl_req)   begin dl_served <= 0; dl_ack <= 0; end
+		if (!eth_req)    eth_ack <= 0;     // two-phase turnaround
+		if (ref_due != 10'h3FF) ref_due <= ref_due + 10'd1;
+
+		if (seq_busy) begin
+			seq <= seq + 3'd1;
+			// CAS phase (auto-precharge), from the values frozen at ACTIVE
+			if (seq == STATE_CMD_CONT) begin
+				sd_cmd <= we_latch ? CMD_WRITE : CMD_READ;
+				if (we_latch) begin sd_data <= din_q; sd_data_oe <= 1'b1; end
+				// always return both bytes in a read. The cpu may not
+				// need it, but the caches need to be able to store everything
+				sd_addr <= { we_latch ? ~ds_q : 2'b00, 2'b10, col_q };  // auto precharge
+			end
+			// early-done for CPU reads: 4 clk_64 (2 clk_sys) before the E7
+			// cpu_dout load. The CPU bus FSM samples done at E4 (its first
+			// clk_sys edge after E3), then latches din TWO clk_sys ticks later
+			// (S_WAIT exit -> S_TAIL2 = E8), so cpu_dout (E7) reaches it over
+			// one clk_64 period — the relationship STA checks. Do not move
+			// done earlier than STATE_CMD_CONT+1, or the load later than
+			// STATE_READ, without redoing that arithmetic.
+			//
+			// ★★ `&& oe` (2026-08-19): done may only be BORN while its request
+			// level is still up. A fetch-cache HIT answers the CPU early, so
+			// the FSM releases AS ~4 ticks in and ABANDONS this transaction;
+			// if its ACTIVE was delayed (floppy window / download / refresh
+			// occupancy) the unqualified set fired AFTER the level dropped —
+			// and, being written after the `!(oe||we)` clear above, it WON the
+			// same-edge conflict. The orphan done then landed inside the NEXT
+			// cycle's S_WAIT sampling window: a false DTACK, the CPU latching
+			// the PREVIOUS access's cpu_dout — the I-cache-enable hang (same
+			// stale-done family as the oe-bridge magenta bug and the
+			// download-ack floppy-mount bomb). Cache-off never abandons (the
+			// FSM waits in S_WAIT for its own done), so this qualifier is
+			// inert there. `oe` alone, not (oe||we): a newly-risen WRITE level
+			// must not legitimise a stale READ's done. Proven both ways by
+			// tb_icache_seam.v (in the verilator dir) — run it (normal AND
+			// the negative control below) after ANY edit to this handshake.
+`ifdef SDRAM_NO_DONE_LEVEL_FIX
+			// NEGATIVE CONTROL (TB only, never synthesised): the pre-fix set,
+			// so tb_icache_seam.v can demonstrate it catches the defect
+			// rather than passing vacuously.
+			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch) cpu_done <= 1;
+`else
+			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch && oe) cpu_done <= 1;
+`endif
+			// Data ready (from the fabric re-timing stage; see the read-capture
+			// block). The floppy word is NOT taken here — it is loaded into
+			// `dout` on the falling edge before this one (flp_cap below).
+			if (seq == STATE_READ) begin
+				if (src_cpu) begin
+					if (oe_latch) cpu_dout <= sd_data_r;
+				end else if (src_eth) begin
+					// eth read completes here: data valid the same edge the
+					// ack rises. Born only while the request level is up (the
+					// done-birth law) — pds_enet never abandons, so this is
+					// belt-and-braces, not load-bearing like the CPU's.
+					if (oe_latch && eth_req) begin
+						eth_dout <= sd_data_r;
+						eth_ack  <= 1;
+					end
+				end
+			end
+			if (seq == 3'd7) seq_busy <= 0;
+		end else if (ref_busy) begin
+			ref_cnt <= ref_cnt + 3'd1;
+			if (ref_cnt == 3'd4) ref_busy <= 0;   // 5 clk_64 = 77 ns > tRFC
+		end else if (req_flp || req_dl || req_cpu || req_eth) begin
+			// start priority: floppy window > download > CPU > ethernet DMA
+			// (req_eth already excludes any live CPU level, so the eth leg of
+			// these muxes can only be reached with the other three false)
+			sd_cmd  <= CMD_ACTIVE;
+			// [gamebub] row bit 12 = word address bit 23 (32 MiB part)
+			sd_addr <= req_flp ? { flp_addr[23], flp_addr[19:8] } :
+			           req_dl  ? { dl_addr[23],  dl_addr[19:8]  } :
+			           req_cpu ? { addr[23],     addr[19:8] }     : { eth_addr[23], eth_addr[19:8] };
+			sd_ba   <= req_flp ? flp_addr[21:20]          :
+			           req_dl  ? dl_addr[21:20]           :
+			           req_cpu ? addr[21:20]              : eth_addr[21:20];
+			din_q   <= req_dl ? dl_din : req_cpu ? din : eth_din;
+			ds_q    <= req_dl ? 2'b11  : req_cpu ? ds  : 2'b11;
+			col_q   <= req_flp ? { flp_addr[22], flp_addr[7:0] } :
+			           req_dl  ? { dl_addr[22],  dl_addr[7:0]  } :
+			           req_cpu ? { addr[22],     addr[7:0] }
+			                   : { eth_addr[22], eth_addr[7:0] };
+			seq      <= 3'd1;
+			seq_busy <= 1;
+			src_cpu  <= !req_flp && !req_dl && req_cpu;
+			src_eth  <= !req_flp && !req_dl && !req_cpu && req_eth;
+			we_latch <= req_flp ? 1'b0 : req_dl ? 1'b1 : req_cpu ? we : eth_we;
+			oe_latch <= req_flp ? 1'b1 : req_dl ? 1'b0 : req_cpu ? oe : !eth_we;
+			if (req_flp) begin
+				flp_served <= 1;
+			end else if (req_dl) begin
+				dl_served <= 1;
+				dl_ack    <= 1;          // ★ never touches cpu_done
+			end else if (req_cpu) begin
+				if (we) cpu_done <= 1;   // posted write: ack at ACTIVE; din/ds
+				                         // stay valid (AS held) through CAS
+			end else begin
+				// eth write: posted like the CPU's (din frozen into din_q here;
+				// pds_enet holds the request until it sees this ack). Reads
+				// ack at STATE_READ with the data. ★ never touches cpu_done.
+				if (eth_we) eth_ack <= 1;
+			end
+		end else if (ref_due >= REF_OPP && !flp_guard && !flp_win && !(dl_req && dl_slot)) begin
+			// !flp_guard/!flp_win: a refresh started just before a floppy
+			// window would push the window's capture past its end — floppy.v
+			// latches on its own (post-window) enables and would read stale
+			// data. The guard zone gives refresh a hard keep-out; plenty of
+			// other idle edges exist (tREF needs one refresh per ~508 clk_64).
+			sd_cmd   <= CMD_AUTO_REFRESH;
+			ref_busy <= 1;
+			ref_cnt  <= 0;
+			ref_due  <= 0;
+		end
+	end
+end
+
+// [gamebub] SDRAM_CLK = inverted clk_64 (the chip's rising edge is a
+// clk_64 falling edge), produced in the output DDR register.
+ODDR #(
+	.DDR_CLK_EDGE("SAME_EDGE"),
+	.INIT(1'b0),
+	.SRTYPE("SYNC")
+) sdramclk_ddr (
+	.Q(sd_clk),
+	.C(clk_64),
+	.CE(1'b1),
+	.D1(1'b0),
+	.D2(1'b1),
+	.R(1'b0),
+	.S(1'b0)
+);
+
+endmodule

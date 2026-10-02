@@ -1,0 +1,5 @@
+Imported by scripts/import_maclc.py - do not edit files here by hand.
+Change the MiSTer source (or the patches in the script) and re-import.
+
+source: ../MacLC_MiSTer
+commit: 045f8967aceaf5fc91f152f20b0b9e60e30efddf
