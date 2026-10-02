@@ -1,0 +1,8 @@
+import mill._
+import mill.scalalib._
+
+object root extends build.framework.FrameworkModule {
+  override def sourcesFolders = Seq("chisel/src")
+
+  override def defaultCoreClass = Some("MacLC")
+}

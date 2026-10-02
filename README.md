@@ -1,22 +1,37 @@
-# Game Bub Framework - BETA
+# Macintosh LC for Game Bub
 
-**This is an unstable BETA release.**
+A port of the [MiSTer Macintosh LC core](../MacLC_MiSTer) to
+[Game Bub](https://gamebub.net/), using the Game Bub Core Framework
+(v1.1-beta, in `framework/` as a git submodule — never edited here).
 
-This repository contains the Game Bub Framework, which allows writing
-custom cores for [Game Bub](https://gamebub.net/) devices.
+**Status: pre-alpha.** The core builds and boots in simulation; it has not
+yet been built with Vivado or run on hardware. See
+[docs/PORT_PLAN.md](docs/PORT_PLAN.md) for scope, limits, and the plan, and
+[docs/BUILDING.md](docs/BUILDING.md) to build, simulate, and install it.
 
-The framework is written using the [Chisel](https://www.chisel-lang.org/)
-HDL, but the framework supports cores that are written in Verilog or VHDL
-as well.
+## Layout
 
-For more information about writing and using custom cores, please see
-the [Game Bub Documentation](https://docs.gamebub.net/).
+| Path | What |
+|---|---|
+| `framework/` | Game Bub framework (submodule, pinned) |
+| `chisel/src/MacLC.scala` | Declares the framework interfaces the core uses |
+| `rtl/gamebub/` | Game Bub platform layer: host protocol, block devices, VRAM in SRAM, video, input, clocks, constraints |
+| `rtl/maclc/` | The Mac itself, **imported** from the MiSTer core by `scripts/import_maclc.py`; never edit by hand |
+| `metadata/` | `core.json`, `files.json`, `settings.json` for the SD card |
+| `sim/` | Verilator testbench (`tb_gamebub.sv`), Xilinx primitive stubs, Verilog CPU for simulation |
+| `scripts/` | `import_maclc.py`, `lint.sh`, `ppm2png.py` |
 
-Note that the framework is not developed in this repository, this is
-a copy of selected files from the parent Game Bub repository. Do not
-file issues or pull requests against this repository.
+## Quick start
+
+```bash
+git submodule update --init
+scripts/lint.sh                         # Verilator lint, any OS
+sim/run_tb.sh +frames=450 +dump=50      # boot in simulation (sim_out/)
+./mill root.buildCore --target gamebub_rev4   # bitstream; needs Vivado (Linux/WSL)
+```
 
 ## License
 
-See `LICENSE` for license information. If you are porting a core from
-somewhere else, please make sure to follow the original code license.
+The machine RTL comes from the MiSTer Macintosh LC core (GPL; based on
+Sorgelig's MacPlus core and Plus Too). TG68K is LGPL. The Game Bub framework
+is used unmodified under CERN-OHL-W (see `framework/LICENSE`).

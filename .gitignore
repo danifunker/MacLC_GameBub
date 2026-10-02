@@ -1,0 +1,43 @@
+# --- Build outputs -----------------------------------------------------------
+# Mill/Chisel and the framework's Vivado runs (bitstreams land in build/)
+/build/
+/out/
+# Vivado debris if it is ever run from the repo root
+.Xil/
+*.jou
+vivado*.log
+vivado_pid*.str
+webtalk*
+usage_statistics_webtalk.*
+
+# --- Simulation --------------------------------------------------------------
+# Verilator builds (sim/run_tb.sh; SIM_OBJ=... makes more) and their logs
+/sim/obj_dir*
+# Frames written by the testbench (+out=<dir> defaults to sim_out)
+/sim_out*/
+# Waveforms
+*.fst
+*.vcd
+
+# --- Copyrighted / personal data: never commit ---------------------------------
+# Apple ROMs, PRAM saves and disk images belong on the SD card, not in git
+*.rom
+*.nvr
+*.hda
+*.vhd
+*.dsk
+*.img
+*.image
+*.iso
+*.toast
+
+# --- Scratch and editor/OS noise -----------------------------------------------
+/scratch/
+.DS_Store
+__pycache__/
+*.pyc
+.bsp/
+.metals/
+.bloop/
+.idea/
+.vscode/
