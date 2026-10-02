@@ -1,0 +1,41 @@
+{
+	"files": [
+		{
+			"id": 3,
+			"label": "Mac LC ROM",
+			"filename": "MacLC.rom",
+			"optional": false,
+			"read_only": true,
+			"address": "0x10A00000",
+			"exact_size": "0x80000"
+		},
+		{
+			"id": 0,
+			"label": "Hard Disk",
+			"extensions": ["hda", "img", "vhd"],
+			"user_selected": true,
+			"optional": true,
+			"address": "0x11000000",
+			"max_size": "0x1000000"
+		},
+		{
+			"id": 1,
+			"label": "PRAM",
+			"extensions": ["nvr"],
+			"dependent_on_0": true,
+			"optional": true,
+			"initialize": true,
+			"address": "0x10A80000",
+			"max_size": "0x200"
+		},
+		{
+			"id": 2,
+			"label": "Floppy Disk",
+			"extensions": ["dsk", "image"],
+			"user_selected": true,
+			"optional": true,
+			"address": "0x10E00000",
+			"max_size": "0x200000"
+		}
+	]
+}

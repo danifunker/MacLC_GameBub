@@ -1,0 +1,12 @@
+{
+	"metadata": {
+		"id": "danifunker.MacLC",
+		"name": "Macintosh LC",
+		"author": "Dani Sarfati",
+		"version": "0.1.0",
+		"license": "GPL-3.0-or-later"
+	},
+	"bitstreams": [
+		{"target": "gamebub_rev4", "filename": "MacLC-gamebub_rev4.bit"}
+	]
+}

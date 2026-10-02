@@ -1,0 +1,55 @@
+{
+	"settings": [
+		{
+			"id": 0,
+			"label": "Memory (on restart)",
+			"address": "0x00000200",
+			"type": "list",
+			"default": "0x1",
+			"items": [
+				{"label": "2 MB", "value": "0x0"},
+				{"label": "10 MB", "value": "0x1"}
+			]
+		},
+		{
+			"id": 1,
+			"label": "Start In",
+			"address": "0x00000208",
+			"type": "list",
+			"default": "0x1",
+			"items": [
+				{"label": "Mouse Mode", "value": "0x1"},
+				{"label": "Keyboard Mode", "value": "0x0"}
+			]
+		},
+		{
+			"id": 2,
+			"label": "Floppy Writes",
+			"address": "0x00000204",
+			"type": "checkbox",
+			"default": "0x0",
+			"value": "0x1"
+		},
+		{
+			"id": 3,
+			"label": "Restart Mac",
+			"address": "0x00000100",
+			"type": "action",
+			"value": "0x1"
+		},
+		{
+			"id": 4,
+			"label": "Interrupt (MacsBug)",
+			"address": "0x00000104",
+			"type": "action",
+			"value": "0x1"
+		},
+		{
+			"id": 5,
+			"label": "Reset PRAM",
+			"address": "0x00000108",
+			"type": "action",
+			"value": "0x1"
+		}
+	]
+}
