@@ -1,0 +1,3 @@
+# Check out LF everywhere, even with core.autocrlf=true on Windows: the build
+# runs in WSL/Linux, where CRLF breaks shell scripts (`mill`: "sh\r" not found).
+* text=auto eol=lf
