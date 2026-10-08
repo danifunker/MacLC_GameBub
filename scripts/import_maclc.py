@@ -14,7 +14,12 @@ and commit.
 
 What goes where:
   rtl/maclc/        machine RTL, built by Vivado (every .v/.sv/.vhdl under
-                    rtl/ is picked up automatically by the framework build)
+                    rtl/ is picked up automatically by the framework build;
+                    any other file type there makes the build crash). MiSTer
+                    .v files are written as .sv so that Vivado parses them
+                    as SystemVerilog, as Verilator does.
+  scripts/import_maclc.txt
+                    the MiSTer commit the RTL was imported from
   sim/tg68k_v/      the GHDL-converted Verilog TG68K, for Verilator only.
                     Vivado builds the VHDL originals, as Quartus does on
                     MiSTer; having both under rtl/ would define the CPU twice.
@@ -310,7 +315,11 @@ def main():
             text = (src_rtl / name).read_text(encoding="latin-1")
             if name in PATCHES:
                 text = PATCHES[name](text, src_rtl)
-            out = dst / name
+            # .v -> .sv: Vivado reads .v as strict Verilog-2001 and rejects what
+            # Quartus lets through (declarations in unnamed blocks in scc.v).
+            # Verilator, used by the lint and the sim, parses everything as
+            # SystemVerilog, so this makes Vivado build what was verified.
+            out = dst / (name[: -len(".v")] + ".sv" if name.endswith(".v") else name)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text, encoding="latin-1")
         for name in VHDL_FILES:
@@ -322,8 +331,10 @@ def main():
     except PatchError as e:
         sys.exit(f"Patch failed (upstream changed?): {e}")
 
-    (dst / "IMPORTED_FROM.txt").write_text(
-        "Imported by scripts/import_maclc.py - do not edit files here by hand.\n"
+    # Not in rtl/: the framework's build_core.py passes every file under rtl/
+    # to edalize, which crashes on types other than .v/.sv/.vhdl/.xdc.
+    (ROOT / "scripts" / "import_maclc.txt").write_text(
+        "rtl/maclc/ is imported by scripts/import_maclc.py - do not edit it by hand.\n"
         "Change the MiSTer source (or the patches in the script) and re-import.\n\n"
         f"source: {os.path.relpath(args.src.resolve(), ROOT)}\n"
         f"commit: {commit}{' (rtl/ had uncommitted changes)' if dirty else ''}\n"

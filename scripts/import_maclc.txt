@@ -1,4 +1,4 @@
-Imported by scripts/import_maclc.py - do not edit files here by hand.
+rtl/maclc/ is imported by scripts/import_maclc.py - do not edit it by hand.
 Change the MiSTer source (or the patches in the script) and re-import.
 
 source: ../MacLC_MiSTer
