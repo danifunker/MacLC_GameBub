@@ -10,10 +10,15 @@
 // FSM — is unchanged.
 //
 // SLOTS (maclc_core numbering)      FILE          SDRAM word base
-//   0  SCSI ID 0 hard disk          0 Hard disk   $800000
+//   0  SCSI ID 0 hard disk          0 Hard disk   $6C0000  (<= 18.5 MiB, to the top)
 //   2  PRAM save image              1 PRAM        $540000  (always 512 B)
-//   6  internal floppy              2 Floppy      $700000
+//   6  internal floppy              2 Floppy      $548000  (<= 1.44 MiB, in the gap
+//                                                           below the floppy
+//                                                           controller's copy)
 //   1, 3, 4, 5 (SCSI 1, Toolbox, CD, CD changer) are never mounted.
+// The floppy controller keeps its own copy of the disk at word $600000
+// (floppy_sd's loader, header stripped): <= 1,474,560 bytes, so it ends below
+// the hard disk at $6C0000. Keep these, gb_host.sv and files.json in step.
 //
 // TRANSFER SHAPE, copied from sys/hps_io.sv (WIDE=1):
 //   read  : sd_ack[n]=1, sd_buff_addr=0; per word: dout, then a one-cycle
@@ -74,9 +79,9 @@ module gb_blockdev #(
 	// Per-slot image description
 	function [23:0] slot_base(input [2:0] s);
 		case (s)
-			SLOT_HD:     slot_base = 24'h800000;
+			SLOT_HD:     slot_base = 24'h6C0000;
 			SLOT_PRAM:   slot_base = 24'h540000;
-			SLOT_FLOPPY: slot_base = 24'h700000;
+			SLOT_FLOPPY: slot_base = 24'h548000;
 			default:     slot_base = 24'h000000;
 		endcase
 	endfunction

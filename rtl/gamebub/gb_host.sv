@@ -16,9 +16,9 @@
 //       0x10A0_0000  ROM       512 KiB   (Mac SDRAM word $500000, fixed by
 //                                         addrController_top)
 //       0x10A8_0000  PRAM      512 B     (word $540000, a gap in the map)
-//       0x10E0_0000  Floppy    <= 2 MiB  (word $700000, the removed second
-//                                         floppy's region)
-//       0x1100_0000  Hard disk <= 16 MiB (word $800000, the upper half)
+//       0x10A9_0000  Floppy    <= 1.44 MiB (word $548000, same gap)
+//                    (word $600000: the floppy controller's own copy)
+//       0x10D8_0000  Hard disk <= 18.5 MiB (word $6C0000, to the top)
 //   0xF000_0000..0xF000_001C  host->core command opcode/params/results
 //   0xF000_1000..             core->host command registers (unused: v1.1
 //                             defines no core->host commands)

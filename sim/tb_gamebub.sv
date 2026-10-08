@@ -452,6 +452,40 @@ module tb_gamebub;
 		end
 	endtask
 
+	// ASC (sound chip) bus cycles: count them, show the first few writes.
+	integer asc_reads = 0, asc_writes = 0;
+	reg     asc_as_d = 1'b1;
+	always @(posedge clk_sys) begin
+		asc_as_d <= dut.mac._cpuAS;
+		if (dut.mac.selectASC && !dut.mac._cpuAS && asc_as_d) begin
+			if (!dut.mac._cpuRW) begin
+				asc_writes = asc_writes + 1;
+				if (asc_writes <= 12)
+					$display("TB ASC: write #%0d addr=%06h data=%04h uds=%b lds=%b frame %0d",
+					         asc_writes, dut.mac.cpuAddr, dut.mac.cpuDataOut,
+					         dut.mac._cpuUDS, dut.mac._cpuLDS, frame);
+			end else begin
+				asc_reads = asc_reads + 1;
+			end
+		end
+	end
+
+	// Audio: what the framework would send to the DAC. Reports the first
+	// non-zero sample; the frame line shows the peak since the last one.
+	integer audio_peak = 0;
+	bit     audio_seen = 1'b0;
+	always @(posedge clk_sys) begin : audio_mon
+		integer l, r;
+		l = $signed(a_left);  if (l < 0) l = -l;
+		r = $signed(a_right); if (r < 0) r = -r;
+		if (l > audio_peak) audio_peak = l;
+		if (r > audio_peak) audio_peak = r;
+		if (!audio_seen && (a_left != 16'd0 || a_right != 16'd0)) begin
+			audio_seen = 1'b1;
+			$display("TB AUDIO: first non-zero sample L=%0d R=%0d at frame %0d", $signed(a_left), $signed(a_right), frame);
+		end
+	end
+
 	// +trace_rd: per-cycle view of the host SDRAM engine and what gates the
 	// controller's eth port, at the start of the first readback.
 	always @(posedge clk_sys) if (trace_left > 0) begin
@@ -532,9 +566,11 @@ module tb_gamebub;
 			if (fy != 384 && frame > 0)
 				$display("TB WARNING: frame %0d had %0d rows", frame, fy);
 			if (frame % 10 == 0) begin
-				$display("TB: frame %0d host=%08h cpu=%08h bd=%08h bad_lines=%0d vram_wr=%0d pal_wr=%0d vmode=%0d",
+				$display("TB: frame %0d host=%08h cpu=%08h bd=%08h bad_lines=%0d vram_wr=%0d pal_wr=%0d vmode=%0d audio_peak=%0d asc_rd=%0d asc_wr=%0d",
 				         frame, dut.dbg_host_state, dut.dbg_cpu_addr, dut.dbg_blockdev,
-				         line_pixels_bad, sram_writes, palette_writes, dut.mac.v8_video_mode);
+				         line_pixels_bad, sram_writes, palette_writes, dut.mac.v8_video_mode, audio_peak,
+				         asc_reads, asc_writes);
+				audio_peak = 0;
 				$fflush;
 			end
 			if (dump_every > 0 && frame > 0 && frame % dump_every == 0) dump_frame(frame);

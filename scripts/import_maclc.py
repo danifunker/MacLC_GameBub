@@ -153,6 +153,24 @@ def patch_include(include_name):
     return patch
 
 
+def patch_asc(text, src_rtl):
+    """Enable the ASC sound model, as MacLC.qsf does.
+
+    MiSTer sets VERILOG_MACRO "USE_ASC_AUDIO=1" in MacLC.qsf. The framework
+    build passes no Verilog macros, and without it asc.sv compiles a register
+    stub whose samples are tied to zero: the ROM programs the chip and fills
+    its FIFO, and nothing is heard (not even the startup chime).
+    """
+    return replace_once(
+        text,
+        "`ifdef USE_ASC_AUDIO\n",
+        '// [gamebub] MacLC.qsf: VERILOG_MACRO "USE_ASC_AUDIO=1"\n'
+        "`define USE_ASC_AUDIO\n"
+        "`ifdef USE_ASC_AUDIO\n",
+        "asc.sv USE_ASC_AUDIO",
+    )
+
+
 def patch_v8_video(text, src_rtl):
     """Replace the 1-cycle BRAM VRAM read with a request/valid handshake.
 
@@ -281,6 +299,7 @@ PATCHES = {
     "egret/egret_wrapper.sv": patch_egret,
     "scsi.v": patch_include("scsi_vendor.vh"),
     "cd_audio.sv": patch_include("cd_vol_lut.vh"),
+    "asc.sv": patch_asc,
     "maclc_v8_video.sv": patch_v8_video,
     "sdram.v": patch_sdram,
 }

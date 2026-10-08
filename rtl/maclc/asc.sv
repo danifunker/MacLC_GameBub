@@ -41,6 +41,8 @@ module asc(
 	output reg    irq      // Active HIGH (PseudoVIA inverts it)
 );
 
+// [gamebub] MacLC.qsf: VERILOG_MACRO "USE_ASC_AUDIO=1"
+`define USE_ASC_AUDIO
 `ifdef USE_ASC_AUDIO
 
 	// ============================================================

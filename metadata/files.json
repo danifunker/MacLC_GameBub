@@ -15,8 +15,8 @@
 			"extensions": ["hda", "img", "vhd"],
 			"user_selected": true,
 			"optional": true,
-			"address": "0x11000000",
-			"max_size": "0x1000000"
+			"address": "0x10D80000",
+			"max_size": "0x1280000"
 		},
 		{
 			"id": 1,
@@ -34,8 +34,8 @@
 			"extensions": ["dsk", "image"],
 			"user_selected": true,
 			"optional": true,
-			"address": "0x10E00000",
-			"max_size": "0x200000"
+			"address": "0x10A90000",
+			"max_size": "0x170000"
 		}
 	]
 }
