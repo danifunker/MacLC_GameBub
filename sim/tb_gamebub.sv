@@ -28,6 +28,11 @@
 //   +dump=<k>       write every k-th frame (default 50)
 //   +out=<dir>      where frames go (default sim_out; must exist)
 //   +odd_pixels     report 1bpp pixels that are neither black nor white
+//   +paced          stream files at the real MCU's fixed SPI rate through a
+//                   model of the framework's FIFOs (see "Paced host model")
+//   +readback       with +paced: read each file back like the MCU's save
+//   +chunk_gap_us=<n>  with +paced: nCS-high gap between 16 KiB chunks (10)
+//   +stop_after_load   end after the files are loaded
 // ============================================================================
 `timescale 1ps/1ps
 `default_nettype none
@@ -242,6 +247,163 @@ module tb_gamebub;
 		end
 	endtask
 
+	// -------------------------------------------------------------------
+	// Paced host model (+paced). The real MCU streams file data over quad
+	// SPI at 10 MHz -- one 32-bit word every 800 ns whether or not the core
+	// keeps up (10 MHz is its slowest SPI rate) -- in 16 KiB transactions,
+	// through framework/.../SpiReceiverFifo.scala:
+	//   * a 512-entry request FIFO; once it is full, the rest of that SPI
+	//     transaction is dropped (fifoRequestOverflow);
+	//   * reads get 2 dummy words (dummyBytes 8 / 4); after that, a word whose
+	//     response has not crossed back goes out as 0xFFFFFFFF
+	//     (fifoResponseUnderflow) and the late response lands on a later word;
+	//   * the system side presents one request at a time, shaped like mem_xfer.
+	// Without +paced the host waits for every word, which hid all of this.
+	// -------------------------------------------------------------------
+	localparam longint SPI_WORD_PS  = 800_000;     // 8 quad clocks at 10 MHz
+	localparam longint SPI_START_PS = 1_600_000;   // command + address
+	localparam longint CDC_PS       = 125_000;     // XPM async FIFO crossing, approx.
+	localparam integer FIFO_DEPTH   = 512;
+	localparam integer CHUNK_BYTES  = 16384;
+	typedef struct { bit start; bit write; bit [31:0] data; longint t; } spi_req_t;
+	spi_req_t   req_q[$];
+	bit [31:0]  resp_q[$];
+	longint     resp_t[$];
+	bit         paced = 1'b0, sys_active = 1'b0;
+	longint     chunk_gap_ps = 10_000_000;           // CS high between chunks
+	integer     sys_xfers = 0, sys_cycles = 0, sys_max = 0, sys_min = 1 << 30;
+	integer     trace_left = -1;                     // +trace_rd
+
+	// The framework's system side: pops the request FIFO one entry at a time.
+	initial begin : sys_side
+		reg [31:0] a;
+		bit        wr;
+		integer    n;
+		forever begin
+			@(posedge clk_sys);
+			if (req_q.size() != 0 && req_q[0].t <= $time) begin
+				sys_active = 1'b1;
+				if (req_q[0].start) begin
+					a  = req_q[0].data;
+					wr = req_q[0].write;
+					void'(req_q.pop_front());
+				end else begin
+					h_en = 1'b1; h_wr = wr; h_addr = a; h_wdata = req_q[0].data;
+					n = 1;
+					@(posedge clk_sys);
+					forever begin
+						@(posedge clk_sys);
+						n = n + 1;
+						if (h_done) break;
+					end
+					h_en = 1'b0;
+					if (!wr) begin
+						resp_q.push_back(h_rdata);
+						resp_t.push_back($time + CDC_PS);
+					end
+					void'(req_q.pop_front());
+					a = a + 32'd4;
+					sys_xfers  = sys_xfers + 1;
+					sys_cycles = sys_cycles + n;
+					if (n > sys_max) sys_max = n;
+					if (n < sys_min) sys_min = n;
+				end
+			end else begin
+				sys_active = 1'b0;
+			end
+		end
+	end
+
+	function automatic [31:0] file_word(input integer n);
+		if (host_be) file_word = {filebuf[n], filebuf[n+1], filebuf[n+2], filebuf[n+3]};
+		else         file_word = {filebuf[n+3], filebuf[n+2], filebuf[n+1], filebuf[n]};
+	endfunction
+
+	task automatic spi_push(input bit start, input bit write, input [31:0] data, inout bit ovf);
+		spi_req_t e;
+		if (ovf) return;
+		if (req_q.size() >= FIFO_DEPTH) begin
+			ovf = 1'b1;
+		end else begin
+			e.start = start; e.write = write; e.data = data; e.t = $time + CDC_PS;
+			req_q.push_back(e);
+		end
+	endtask
+
+	task automatic wait_host_idle();
+		do @(posedge clk_sys); while (req_q.size() != 0 || sys_active);
+	endtask
+
+	// One file, the way core/mod.rs load_files() sends it.
+	task automatic spi_write_file(input [31:0] addr, input integer len, output integer dropped);
+		integer off, n;
+		bit ovf;
+		dropped = 0;
+		for (off = 0; off < len; off = off + CHUNK_BYTES) begin
+			ovf = 1'b0;
+			#(SPI_START_PS);
+			spi_push(1'b1, 1'b1, addr + off, ovf);
+			for (n = off; n < off + CHUNK_BYTES && n < len; n = n + 4) begin
+				#(SPI_WORD_PS);
+				spi_push(1'b0, 1'b1, file_word(n), ovf);
+				if (ovf) dropped = dropped + 1;
+			end
+			#(chunk_gap_ps);
+		end
+	endtask
+
+	// Read a file back the way core/mod.rs persist_files() does; count words
+	// that differ from what was loaded and words that went out as underflow.
+	task automatic spi_read_file(input [31:0] addr, input integer len,
+	                             output integer bad, output integer underflows);
+		integer off, k, words, dummy;
+		bit ovf;
+		reg [31:0] w;
+		bad = 0; underflows = 0;
+		for (off = 0; off < len; off = off + CHUNK_BYTES) begin
+			wait_host_idle();
+			resp_q.delete(); resp_t.delete();      // reset on nCS falling
+			ovf = 1'b0;
+			#(SPI_START_PS);
+			spi_push(1'b1, 1'b0, addr + off, ovf);
+			words = ((len - off) < CHUNK_BYTES ? (len - off) : CHUNK_BYTES) / 4;
+			dummy = 2;
+			for (k = 0; k < words + 2; k = k + 1) begin
+				#(SPI_WORD_PS);
+				spi_push(1'b0, 1'b0, 32'd0, ovf);   // a read request every word
+				if (dummy != 0) begin
+					dummy = dummy - 1;
+				end else begin
+					if (resp_q.size() != 0 && resp_t[0] <= $time) begin
+						w = resp_q.pop_front();
+						void'(resp_t.pop_front());
+					end else begin
+						w = 32'hFFFF_FFFF;
+						underflows = underflows + 1;
+					end
+					if (w != file_word(off + (k - 2) * 4)) bad = bad + 1;
+				end
+			end
+			#(chunk_gap_ps);
+		end
+		wait_host_idle();
+	endtask
+
+	// What the core actually stored: a verbatim 32-bit word is two SDRAM
+	// words, [31:16] at the lower one (see gb_host.sv).
+	function automatic integer sdram_mismatches(input [31:0] addr, input integer len);
+		integer n, bad;
+		reg [23:0] wa;
+		reg [31:0] w;
+		bad = 0;
+		for (n = 0; n < len; n = n + 4) begin
+			wa = (addr - 32'h1000_0000 + n) >> 1;
+			w  = file_word(n);
+			if (sdram[wa] != w[31:16] || sdram[wa + 24'd1] != w[15:0]) bad = bad + 1;
+		end
+		sdram_mismatches = bad;
+	endfunction
+
 	// Write a file the way the MCU does: 4 bytes per 32-bit word.
 	task automatic load_file(input [15:0] id, input string path, input [31:0] addr,
 	                         input integer fill_ff, input integer fill_len, output integer len);
@@ -262,13 +424,45 @@ module tb_gamebub;
 		end
 		$display("TB: file %0d: %0d bytes -> host 0x%08h (%s)", id, len, addr, path == "" ? "0xFF fill" : path);
 		host_cmd(16'h0300, {16'd0, id}, 32'd0, 32'd0, r);
-		for (n = 0; n < len; n = n + 4) begin
-			if (host_be) w = {filebuf[n], filebuf[n+1], filebuf[n+2], filebuf[n+3]};
-			else         w = {filebuf[n+3], filebuf[n+2], filebuf[n+1], filebuf[n]};
-			mem_write(addr + n, w);
+		if (paced) begin : paced_load
+			integer dropped, bad, uf, x0, c0;
+			real    avg;
+			x0 = sys_xfers; c0 = sys_cycles; sys_max = 0; sys_min = 1 << 30;
+			spi_write_file(addr, len, dropped);
+			wait_host_idle();
+			avg = real'(sys_cycles - c0) / real'(sys_xfers - x0 > 0 ? sys_xfers - x0 : 1);
+			// The core answers FileWriteEnd only once the file is in SDRAM.
+			host_cmd(16'h0301, {16'd0, id}, len, 32'd0, r);
+			$display("TB PACED: file %0d load: %0d words, %0d dropped by FIFO overflow, %0d wrong in SDRAM; core took %0d..%0d cycles/word (avg %0.1f; 26 = 800 ns)",
+			         id, len / 4, dropped, sdram_mismatches(addr, len), sys_min, sys_max, avg);
+			if ($test$plusargs("readback")) begin
+				// As core/mod.rs persist_files(): FileReadStart, data, FileReadEnd.
+				host_cmd(16'h0302, {16'd0, id}, 32'd0, 32'd0, r);
+				if ($test$plusargs("trace_rd") && trace_left < 0) trace_left = 600;
+				x0 = sys_xfers; c0 = sys_cycles; sys_max = 0; sys_min = 1 << 30;
+				spi_read_file(addr, len, bad, uf);
+				host_cmd(16'h0303, {16'd0, id}, 32'd0, 32'd0, r);
+				$display("TB PACED: file %0d readback: %0d of %0d words wrong, %0d underflows (0xFFFFFFFF); core took %0d..%0d cycles/word (avg %0.1f)",
+				         id, bad, len / 4, uf, sys_min, sys_max,
+				         real'(sys_cycles - c0) / real'(sys_xfers - x0 > 0 ? sys_xfers - x0 : 1));
+			end
+		end else begin
+			for (n = 0; n < len; n = n + 4) mem_write(addr + n, file_word(n));
+			host_cmd(16'h0301, {16'd0, id}, len, 32'd0, r);
 		end
-		host_cmd(16'h0301, {16'd0, id}, len, 32'd0, r);
 	endtask
+
+	// +trace_rd: per-cycle view of the host SDRAM engine and what gates the
+	// controller's eth port, at the start of the first readback.
+	always @(posedge clk_sys) if (trace_left > 0) begin
+		$display("TR t=%0d ms=%0d e=%0d req=%b ack=%b | eth_req=%b eth_ack=%b oe=%b we=%b flp_win=%b flp_guard=%b seq_busy=%b ref_busy=%b ref_due=%0d tc=%0d | rq=%0d pf=%b",
+		         $time / 1000, dut.host.ms, dut.host.e, dut.host.win_req, dut.host.win_ack,
+		         dut.mac.sdram.eth_req, dut.mac.sdram.eth_ack, dut.mac.sdram.oe, dut.mac.sdram.we,
+		         dut.mac.sdram.flp_win, dut.mac.sdram.flp_guard, dut.mac.sdram.seq_busy,
+		         dut.mac.sdram.ref_busy, dut.mac.sdram.ref_due, dut.mac.sdram.t,
+		         dut.host.rq_count, dut.host.pf_active);
+		trace_left = trace_left - 1;
+	end
 
 	// -------------------------------------------------------------------
 	// Frame capture (what the framework stores)
@@ -367,6 +561,11 @@ module tb_gamebub;
 		if (!$value$plusargs("frames=%d", max_frames)) max_frames = 400;
 		if (!$value$plusargs("dump=%d", dump_every)) dump_every = 50;
 		if (!$value$plusargs("out=%s", out_dir)) out_dir = "sim_out";
+		if ($test$plusargs("paced")) paced = 1'b1;
+		begin : gap_arg
+			integer g;
+			if ($value$plusargs("chunk_gap_us=%d", g)) chunk_gap_ps = longint'(g) * 1_000_000;
+		end
 
 		wait (!fw_reset);
 		repeat (10) @(posedge clk_sys);
@@ -384,6 +583,10 @@ module tb_gamebub;
 		load_file(1, nvr_path, 32'h10A8_0000, 1, 512, len);
 		if (hd_path != "")     load_file(0, hd_path, 32'h1100_0000, 0, 0, len);
 		if (floppy_path != "") load_file(2, floppy_path, 32'h10E0_0000, 0, 0, len);
+		if ($test$plusargs("stop_after_load")) begin
+			$display("TB: +stop_after_load, done");
+			$finish;
+		end
 
 		host_cmd(16'h0102, 0, 0, 0, r);           // SetupComplete
 		host_cmd(16'h0000, 0, 0, 0, r);

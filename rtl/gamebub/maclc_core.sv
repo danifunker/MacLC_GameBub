@@ -138,6 +138,7 @@ module maclc_core #(
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
 	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset
+	wire      clk8_en_p, clk8_en_n;     // from v8_clocks below (declared before first use)
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
 		reg [15:0] rst_cnt;
@@ -500,7 +501,6 @@ module maclc_core #(
 	// interconnects
 	// CPU
 	wire clk8, _cpuReset, _cpuReset_o, _cpuUDS, _cpuLDS, _cpuRW, _cpuAS;
-	wire clk8_en_p, clk8_en_n;
 	wire clk16_en_p, clk16_en_n;
 	// V8 SCSI_PCLK / SCC RTxC source — see v8_clocks.sv.
 	wire scsi_pclk_en;
@@ -1202,7 +1202,7 @@ module maclc_core #(
 	wire        mem_eth_req, mem_eth_we, mem_eth_ack;
 	wire [23:0] mem_eth_addr;
 	wire [15:0] mem_eth_din, mem_eth_dout;
-	eth_port_arb eth_port_arb_i
+	gb_eth_arb eth_port_arb_i
 	(
 		.clk    ( clk_sys ),
 		.reset  ( !pll_locked_s ),

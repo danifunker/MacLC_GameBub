@@ -208,7 +208,7 @@ module maclc_gamebub #(
 	wire        pm_req, pm_we, pm_ack;
 	wire [23:0] pm_addr;
 	wire [15:0] pm_din, pm_dout;
-	eth_port_arb pm_arb (
+	gb_eth_arb pm_arb (
 		.clk    ( clk_sys ),
 		.reset  ( reset ),
 		.a_req  ( host_sd_req ), .a_we ( host_sd_we ), .a_addr ( host_sd_addr ),

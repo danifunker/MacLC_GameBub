@@ -187,8 +187,8 @@ module gb_host #(
 	reg         run_d = 1'b0;
 
 	// ---------------------------------------------------------------------
-	// SDRAM requesters: the host window and the ROM fixup, merged by an
-	// eth_port_arb (window first) into this module's single client port.
+	// SDRAM requesters: the host window and the ROM fixup, merged by a
+	// gb_eth_arb (window first) into this module's single client port.
 	// ---------------------------------------------------------------------
 	reg         win_req = 1'b0, win_we = 1'b0;
 	reg  [23:0] win_addr;
@@ -202,7 +202,7 @@ module gb_host #(
 	wire        fix_ack;
 	wire [15:0] fix_dout;
 
-	eth_port_arb host_arb (
+	gb_eth_arb host_arb (
 		.clk    ( clk ),
 		.reset  ( reset ),
 		.a_req  ( win_req ), .a_we ( win_we ), .a_addr ( win_addr ),
@@ -215,19 +215,67 @@ module gb_host #(
 
 	// ---------------------------------------------------------------------
 	// Host memory transactions
+	//
+	// The MCU streams files at a fixed pace -- quad SPI at 10 MHz, its
+	// slowest rate, one 32-bit word per 800 ns (26 clk) -- and the
+	// framework's SpiReceiverFifo drops what the core does not take in time:
+	// a full request FIFO (512) discards the rest of the SPI transaction, and
+	// a read whose answer is late goes out as 0xFFFFFFFF. A host word is two
+	// SDRAM accesses through the eth port; doing them one host transaction
+	// at a time cost ~28 clk/word, which lost a third of the ROM on hardware
+	// (reproduced with sim/tb_gamebub.sv +paced +readback). So:
+	//   * SDRAM writes are POSTED into wq and drained by the engine below;
+	//   * SDRAM reads are PREFETCHED: a read starts a sequential fetch into
+	//     rq, so the following requests are answered from it at once;
+	//   * commands wait until wq has drained, so FileWriteEnd and everything
+	//     after it (blockdev mounts, the ROM fixup) see whole files.
 	// ---------------------------------------------------------------------
-	localparam [2:0] MS_IDLE = 3'd0, MS_SD_REQ = 3'd1, MS_SD_DROP = 3'd2,
-	                 MS_SD_GAP = 3'd3, MS_DONE = 3'd4;
-	reg  [2:0]  ms = MS_IDLE;
-	reg         ms_half;             // 0 = upper 16 bits (lower SDRAM word), 1 = lower
-	reg         ms_write;
-	reg  [31:0] ms_wdata;
-	reg  [31:0] ms_rdata;
-
 	wire        is_sdram = (mem_address[31:28] == 4'h1);
 	wire        is_cmd   = (mem_address[31:12] == 20'hF0000) && (mem_address[11:5] == 7'd0);
 	wire        is_local = (mem_address[31:12] == 20'h00000);
 	wire [11:0] loc      = mem_address[11:0];
+
+	localparam [1:0] MS_IDLE = 2'd0, MS_RD = 2'd1, MS_DONE = 2'd2;
+	reg  [1:0]  ms = MS_IDLE;
+	reg  [22:0] rd_addr;             // 32-bit word address of the pending read
+
+	// Write queue: {32-bit word address, data}, block RAM, registered read.
+	localparam integer WQ_AW = 9;    // 512 words
+	reg  [54:0]     wq_mem [0:(1 << WQ_AW) - 1];
+	reg  [54:0]     wq_head;
+	reg  [WQ_AW:0]  wq_wp = '0, wq_rp = '0;
+	wire            wq_empty = (wq_wp == wq_rp);
+	wire            wq_full  = (wq_wp[WQ_AW] != wq_rp[WQ_AW]) &&
+	                           (wq_wp[WQ_AW-1:0] == wq_rp[WQ_AW-1:0]);
+	wire            wq_push  = (ms == MS_IDLE) && mem_enable && !mem_done && is_sdram
+	                           && mem_write && !wq_full && !reset;
+	always @(posedge clk) begin
+		if (wq_push) wq_mem[wq_wp[WQ_AW-1:0]] <= {mem_address[24:2], mem_dataWrite};
+		wq_head <= wq_mem[wq_rp[WQ_AW-1:0]];
+	end
+
+	// Read-ahead queue: 8 words starting at word address rq_addr.
+	reg  [31:0]     rq_mem [0:7];
+	reg  [3:0]      rq_wp = 4'd0, rq_rp = 4'd0;
+	wire [3:0]      rq_count = rq_wp - rq_rp;
+	reg  [22:0]     rq_addr;         // address of the word at rq_rp
+	reg  [22:0]     pf_addr;         // next address the engine fetches
+	reg             pf_active = 1'b0;
+
+	// SDRAM engine: one 32-bit word = two eth-port accesses, [31:16] first.
+	localparam [2:0] E_IDLE = 3'd0, E_LOAD = 3'd1, E_HI = 3'd2, E_HI_DROP = 3'd3,
+	                 E_LO = 3'd4, E_LO_DROP = 3'd5;
+	reg  [2:0]  e = E_IDLE;
+	reg         e_write;             // draining wq (1) or reading ahead (0)
+	reg         e_discard;           // read-ahead result no longer wanted
+	reg  [22:0] e_addr;
+	reg  [31:0] e_data;
+	wire        wq_drained = wq_empty && !(e != E_IDLE && e_write);
+	// A read in sequence with the read-ahead, a read that restarts it, and a
+	// read-ahead word being stored this cycle.
+	wire        rd_in_seq  = pf_active && (rq_addr == rd_addr);
+	wire        pf_restart = (ms == MS_RD) && !rd_in_seq && wq_drained;
+	wire        e_push     = (e == E_LO_DROP) && !win_ack && !e_write && !e_discard;
 
 	function [31:0] local_read(input [11:0] a);
 		case (a)
@@ -272,6 +320,13 @@ module gb_host #(
 			mem_done       <= 1'b0;
 			mem_dataRead   <= 32'd0;
 			ms             <= MS_IDLE;
+			wq_wp          <= '0;
+			wq_rp          <= '0;
+			rq_wp          <= 4'd0;
+			rq_rp          <= 4'd0;
+			pf_active      <= 1'b0;
+			e              <= E_IDLE;
+			e_discard      <= 1'b0;
 			win_req        <= 1'b0;
 			cmd_state      <= CS_IDLE;
 			setup_done     <= 1'b0;
@@ -308,17 +363,21 @@ module gb_host #(
 			MS_IDLE: if (mem_enable && !mem_done) begin
 				if (is_sdram) begin
 					// Verbatim 32-bit word -> two SDRAM words (see header).
-					ms_write <= mem_write;
-					ms_wdata <= mem_dataWrite;
-					ms_half  <= 1'b0;
-					win_addr <= {mem_address[24:2], 1'b0};
-					win_we   <= mem_write;
-					win_din  <= mem_dataWrite[31:16];
-					win_req  <= 1'b1;
-					ms       <= MS_SD_REQ;
-					if (mem_write && mem_address == ROM_HOST_ADDR && !rom_first_seen) begin
-						rom_first_word <= mem_dataWrite;
-						rom_first_seen <= 1'b1;
+					if (mem_write) begin
+						// Posted: wq_push stores it this cycle. With wq full the
+						// request just waits here; the framework FIFO holds the rest.
+						if (!wq_full) begin
+							wq_wp     <= wq_wp + 1'd1;
+							pf_active <= 1'b0;   // a write invalidates the read-ahead
+							if (mem_address == ROM_HOST_ADDR && !rom_first_seen) begin
+								rom_first_word <= mem_dataWrite;
+								rom_first_seen <= 1'b1;
+							end
+							ms <= MS_DONE;
+						end
+					end else begin
+						rd_addr <= mem_address[24:2];
+						ms      <= MS_RD;
 					end
 				end else begin
 					if (mem_write) begin
@@ -345,23 +404,24 @@ module gb_host #(
 					ms <= MS_DONE;
 				end
 			end
-			MS_SD_REQ: if (win_ack) begin
-				win_req <= 1'b0;
-				if (!ms_half) ms_rdata[31:16] <= win_dout;
-				else          ms_rdata[15:0]  <= win_dout;
-				ms <= MS_SD_DROP;
-			end
-			MS_SD_DROP: if (!win_ack) ms <= MS_SD_GAP;
-			MS_SD_GAP: begin
-				if (!ms_half) begin
-					ms_half  <= 1'b1;
-					win_addr <= win_addr + 24'd1;
-					win_din  <= ms_wdata[15:0];
-					win_req  <= 1'b1;
-					ms       <= MS_SD_REQ;
-				end else begin
-					mem_dataRead <= ms_rdata;
-					ms           <= MS_DONE;
+			MS_RD: begin
+				if (rd_in_seq) begin
+					// In sequence: answer from the read-ahead, or wait for the
+					// engine to deliver it.
+					if (rq_count != 4'd0) begin
+						mem_dataRead <= rq_mem[rq_rp[2:0]];
+						rq_rp        <= rq_rp + 4'd1;
+						rq_addr      <= rq_addr + 23'd1;
+						ms           <= MS_DONE;
+					end
+				end else if (pf_restart) begin
+					// (Re)start the read-ahead here. A word the engine stores
+					// this very cycle belongs to the old stream: skip it too.
+					pf_active <= 1'b1;
+					rq_rp     <= rq_wp + (e_push ? 4'd1 : 4'd0);
+					rq_addr   <= rd_addr;
+					pf_addr   <= rd_addr;
+					if (e != E_IDLE && !e_write) e_discard <= 1'b1;
 				end
 			end
 			MS_DONE: begin
@@ -371,11 +431,71 @@ module gb_host #(
 			default: ms <= MS_IDLE;
 			endcase
 
+			// ---- SDRAM engine: drain wq first, otherwise read ahead ----
+			case (e)
+			E_IDLE: begin
+				if (!wq_empty) begin
+					e_write <= 1'b1;
+					e       <= E_LOAD;   // wq_head is read from wq_rp this cycle
+				end else if (pf_active && rq_count != 4'd8 && !pf_restart) begin
+					e_write   <= 1'b0;
+					e_discard <= 1'b0;
+					e_addr    <= pf_addr;
+					pf_addr   <= pf_addr + 23'd1;
+					win_addr  <= {pf_addr, 1'b0};
+					win_we    <= 1'b0;
+					win_req   <= 1'b1;
+					e         <= E_HI;
+				end
+			end
+			E_LOAD: begin
+				e_addr   <= wq_head[54:32];
+				e_data   <= wq_head[31:0];
+				win_addr <= {wq_head[54:32], 1'b0};
+				win_we   <= 1'b1;
+				win_din  <= wq_head[31:16];
+				win_req  <= 1'b1;
+				e        <= E_HI;
+			end
+			E_HI: if (win_ack) begin
+				win_req <= 1'b0;
+				if (!e_write) e_data[31:16] <= win_dout;
+				e <= E_HI_DROP;
+			end
+			// The arbiters release on the edge where the ack falls and pass a
+			// new request straight through, so the second half can be
+			// requested right away.
+			E_HI_DROP: if (!win_ack) begin
+				win_addr <= {e_addr, 1'b1};
+				win_din  <= e_data[15:0];
+				win_req  <= 1'b1;
+				e        <= E_LO;
+			end
+			E_LO: if (win_ack) begin
+				win_req <= 1'b0;
+				if (!e_write) e_data[15:0] <= win_dout;
+				e <= E_LO_DROP;
+			end
+			E_LO_DROP: if (!win_ack) begin
+				if (e_write) wq_rp <= wq_rp + 1'd1;
+				if (e_push) begin
+					rq_mem[rq_wp[2:0]] <= e_data;
+					rq_wp <= rq_wp + 4'd1;
+				end
+				e_discard <= 1'b0;
+				e         <= E_IDLE;
+			end
+			default: e <= E_IDLE;
+			endcase
+
 			// ---- command channel ----
 			if (cmd_request) begin
-				if (cmd_state == CS_IDLE) begin
+				// Not before the posted writes are in SDRAM (FileWriteEnd must
+				// mean the file is there); every command also ends a read-ahead.
+				if (cmd_state == CS_IDLE && wq_drained) begin
 					cmd_state  <= CS_DONE;
 					cmd_reg[0] <= 32'd0;
+					pf_active  <= 1'b0;
 					case (opcode)
 					CMD_GET_STATUS:
 						cmd_reg[0] <= !setup_done ? STATUS_SETUP :
