@@ -26,12 +26,12 @@ set_multicycle_path -setup -end 2 -to [get_cells -quiet -hier -filter {NAME =~ *
 set_multicycle_path -hold  -end 1 -to [get_cells -quiet -hier -filter {NAME =~ */mac/periph_din_reg_reg*}]
 
 ## ---- SDRAM (W9825G6KH-6) -------------------------------------------------------
-## The SDRAM clock is clk_mem inverted by an ODDR (sdram.v sdramclk_ddr): the
+## The SDRAM clock is clk_mem inverted by an ODDR (sdram.sv sdramclk_ddr): the
 ## chip samples commands half a clk_mem period after the controller launches
 ## them, and the controller captures DQ on clk_mem's falling edge, one full
 ## period after the chip launched it (CAS latency 2). Same scheme and numbers
 ## as MiSTer's MacLC.sdc, which measured +2.2 ns setup on Cyclone V.
-create_generated_clock -name sdram_clk -invert \
+create_generated_clock -name sdram_clk -divide_by 1 -invert \
 	-source [get_pins -quiet -of_objects [get_cells -quiet -hier -filter {NAME =~ */mac/sdram/sdramclk_ddr}] -filter {REF_PIN_NAME == C}] \
 	[get_ports sdram_clk]
 
@@ -43,7 +43,7 @@ set_output_delay -clock sdram_clk -max  2.0 [get_ports {sdram_a[*] sdram_bs[*] s
 set_output_delay -clock sdram_clk -min -0.8 [get_ports {sdram_a[*] sdram_bs[*] sdram_dq[*] sdram_ldqm sdram_udqm sdram_cas_n sdram_ras_n sdram_we_n sdram_cs_n[0]}]
 
 ## Registers in the I/O blocks: their pin timing then cannot change with
-## placement — the lesson of rtl/maclc/sdram.v's 2026-09-12 read-capture note.
+## placement — the lesson of rtl/maclc/sdram.sv's 2026-09-12 read-capture note.
 ## (sd_addr also drives DQM and sd_data_oe fans out to 16 pins, so those two
 ## stay in the fabric.)
 set_property IOB TRUE [get_cells -quiet -hier -filter {NAME =~ */mac/sdram/sd_data_q_reg*}]

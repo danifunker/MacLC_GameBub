@@ -18,9 +18,12 @@ class MacLC extends Module with Core {
   // 32.5 MHz is not negotiable: rtl/maclc/v8_clocks.sv hard-codes it, and the
   // VIA, Egret and SCC timings are derived from it.
   val systemHz = vcoHz / 20
-  // The LCD clock may be anything inside the ILI9806E window for the frame
-  // rate; 32.5 MHz sits comfortably inside it at 60 Hz.
-  val displayHz = vcoHz / 20
+  // The LCD clock must keep the framework's ILI9806E line at <= 612 clocks
+  // (floor(framePeriod * displayHz / 808)). Above that, its back-porch clamp
+  // runs with the wrong sign (amount = hBackPorchMax - hBackPorch < 0), DE is
+  // set but never cleared, and the panel shows nothing (seen on hardware with
+  // 32.5 MHz: 668 clocks, DE falls at x = 721 > 667). 29.55 MHz gives 607.
+  val displayHz = vcoHz / 22
   // The MCU SPI sampling clock must be at least 160 MHz.
   val spiHz = vcoHz / 4
 
