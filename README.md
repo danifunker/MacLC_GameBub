@@ -94,6 +94,13 @@ sim/run_tb.sh +frames=450 +dump=50      # boot in simulation (sim_out/)
 
 ## License
 
-The machine RTL comes from the MiSTer Macintosh LC core (GPL; based on
-Sorgelig's MacPlus core and Plus Too). TG68K is LGPL. The Game Bub framework
-is used unmodified under CERN-OHL-W (see `framework/LICENSE`).
+**GPL-3.0-or-later** (see [LICENSE](LICENSE)). The machine RTL comes from the
+MiSTer Macintosh LC core, based on Sorgelig's MacPlus core and Plus Too. Its
+files are GPL-2.0-or-later and GPL-3.0-or-later, and the TG68K CPU is
+LGPL-3.0-or-later, so the core as a whole is GPL-3.0-or-later. The Game Bub
+framework is used unmodified under CERN-OHL-W-2.0 (see `framework/LICENSE`).
+The release bitstreams contain both; their source is this repository and
+the pinned framework submodule.
+
+Apple's ROMs and system software are not covered by this license and are not
+included.
