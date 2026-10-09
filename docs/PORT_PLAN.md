@@ -1,7 +1,8 @@
 # MacLC → Game Bub port: scope and plan
 
-Status (2026-09-30): **phases 0 and 1 done in simulation, nothing built or run
-on hardware yet.** See [Progress](#7-progress) at the end.
+Status (2026-10-09): **phases 0–3 done: the core runs on a Game Bub rev 4**
+and boots System 7.1 from floppy or hard disk, with colour and sound. See
+[Progress](#7-progress) at the end.
 Source core: `../MacLC_MiSTer` (full-featured MiSTer core).
 Reference port: `../MacLC_pocket` (Analogue Pocket, v1.2.0, boots 7.5.5). It
 already solved the "no HPS" problems (block device, gamepad input, 48 kHz
@@ -63,8 +64,8 @@ Files in `files.json` (max 8) are **copied whole into core memory at setup**
 and **copied back whole on core exit** (unless `read_only`). Default
 5,000 KB/s.
 - HD images must fit in SDRAM alongside RAM and ROM. With one 32 MiB chip:
-  10 MB RAM + 512 KB ROM + floppies leaves **~18–20 MB of HD**. With both chips
-  it would be ~50 MB.
+  10 MB RAM + 512 KB ROM + floppies leaves **19,398,656 bytes (18.5 MiB) of
+  HD** (the map is in §7). With both chips it would be ~50 MB.
 - Writes persist **only on a clean core exit**. A crash or power loss loses
   the session's disk writes.
 - **No mid-session media change.** Workaround: preload up to N floppy images
@@ -111,7 +112,7 @@ but no commands are defined.
 |---|---|
 | RTL editing, Verilator sim (5.052 installed) | This Mac |
 | Chisel elaboration (`./mill`) | This Mac should work. Needs a JDK Scala 2.13.16 supports; JDK 25 is installed and may need 17/21. Not yet verified. |
-| Vivado 2023.2+ synthesis/P&R, `./mill root.buildCore --target gamebub_rev4` | **Linux or Windows only** (Vivado has no macOS build). Needs Python ≥ 3.12. The free Vivado ML Standard covers the XC7A100T. |
+| Vivado 2023.2+ synthesis/P&R, `./mill root.buildCore --target gamebub_rev4` | **Linux or Windows only** (Vivado has no macOS build). Needs Python ≥ 3.12. The free Vivado ML Standard covers the XC7A100T. Built with 2025.2 in WSL Ubuntu 24.04. |
 | Deploy | Copy `.bit` + `core.json`/`files.json`/`settings.json` to `/cores/<Author.Name>/` on a FAT32/MBR microSD |
 
 Repo layout: the official template (`github.com/gamebub/core-example`) is a
@@ -164,8 +165,9 @@ pristine and updatable.
   3/3/3), audio, host, input, sdram, sram.
 - Clocks: one MMCM from 50 MHz with VCO 650 MHz (M=13). /20 = **32.5 MHz sys**
   (the value `v8_clocks` hard-codes), /10 = **65 MHz SDRAM** (8× bus clock, as
-  on the Pocket), /4 = **162.5 MHz SPI** (≥160 required), /20 = **32.5 MHz
-  display** (inside ILI9806E's 25.8–35 MHz window).
+  on the Pocket), /4 = **162.5 MHz SPI** (≥160 required), /22 = **29.55 MHz
+  display** (the plan said /20 = 32.5 MHz; the framework's ILI9806E timing
+  only works up to ~29.7 MHz, see FRAMEWORK_ISSUES.md #3).
 - `rtl/gamebub/maclc_gamebub.sv` (framework-facing top) and
   `rtl/gamebub/maclc_core.sv` (the machine top, from `MacLC.sv` and the
   Pocket's `mac_lc_pocket.sv`):
@@ -247,22 +249,45 @@ pristine and updatable.
     within 16 of black or white to the extreme (found with
     `sim/run_tb.sh +odd_pixels`).
 
+### Done on hardware (2026-10-08)
+Game Bub rev 4, firmware 1.1.0-beta2, Vivado 2025.2. Release
+`releases/MacLC_GameBub_20261008.zip` (commit `fb8b802`).
+- **Vivado build** (`30ff674`): three parse fixes in the imported RTL. 127 of
+  135 BRAM36; timing met (WNS +0.56 ns, WHS +0.036 ns).
+- **Clocks and LCD** (`e92a591`): the SDRAM clock constraint was dropped,
+  leaving its pins untimed; the display clock net must be named `clk_dpi`;
+  the display clock is 29.55 MHz because the framework's LCD driver keeps DE
+  high above ~29.7 MHz (found with the ILA).
+- **File transfers** (`de5c75a`): the MCU streams files at a fixed rate and
+  the framework drops what the core cannot take, so the ROM loaded with
+  holes and saves came back as 0xFF. `gb_host` now posts SDRAM writes into a
+  queue and reads ahead. ROM, floppy and PRAM load and save byte-for-byte.
+- **Sound and a bigger disk** (`fb8b802`): the ASC model needed
+  `USE_ASC_AUDIO`; the hard disk cap is now 19,398,656 bytes.
+- Results: the startup chime, colour, System 7.1 from the Disk Tools floppy
+  and from an 18.5 MiB hard disk image with applications; disk and PRAM
+  changes saved on exit.
+- Bugs found in the framework and firmware are written up in
+  `docs/FRAMEWORK_ISSUES.md`. The JTAG/ILA tooling is in `scripts/debug/`.
+
+SDRAM map (bytes, 32 MiB; `gb_blockdev.sv`, `gb_host.sv` and `files.json`
+must agree):
+
+| Range | What |
+|---|---|
+| `0x000000`–`0x9FFFFF` | RAM (10 MB) |
+| `0xA00000` | ROM (512 KiB) |
+| `0xA80000` | PRAM |
+| `0xA90000` | floppy file (≤ `0x170000`) |
+| `0xC00000` | floppy controller's copy (≤ 1,474,560) |
+| `0xD80000`–`0x1FFFFFF` | hard disk (≤ `0x1280000`) |
+
 ### Next
-1. **First Vivado build** on the WSL box (docs/BUILDING.md). Expect to fix
-   Vivado-only parse issues in the imported Quartus-era RTL. Then read:
-   - **Block RAM.** The framework frame buffer is ~96 of 135 BRAM36. If the
-     total overflows, the cheap fixes are, in order: drop SCSI disk targets'
-     `RING_LOG` 5→3 (the ring hid MiSTer HPS latency; SDRAM serves a sector
-     in ~80 µs); remove the CD-ROM target from `ncr5380.sv` (no CD source on
-     Game Bub); shrink the Toolbox buffer (`TB_ADDRW` 12→8); video 3/3/3→3/3/2.
-   - **Timing** (WNS), and the I/O report for the SDRAM/SRAM constraints.
-2. **Hardware bring-up.** Copy files per BUILDING.md §3 and watch the PMOD
-   beacon (word 0 = `4842....`, bit 3 = ROM fixup done, bit 1 = running;
-   word 5 = CPU address).
-3. **Things only hardware can answer:**
-   - the MCU's file byte order (auto-detected, but confirm on the beacon:
-     word 0 bits 10:9);
-   - whether two `user_selected` files are allowed;
-   - whether actions are replayed at setup (guarded anyway);
-   - real SDRAM timing margins.
-4. Feature requests upstream (§3).
+1. **Larger disks and CD-ROM** need random-access file I/O between core and
+   MCU, which firmware 1.1.0-beta2 does not have: an upstream request
+   (FRAMEWORK_ISSUES.md #6), or a fork of the open-source firmware
+   (github.com/elipsitz/gamebub). The second SDRAM chip (#7) would add
+   32 MiB of hard disk in the meantime.
+2. File the FRAMEWORK_ISSUES.md items upstream.
+3. Optional user-selected files cannot be skipped (#8): until fixed, users
+   need a placeholder hard disk image for floppy-only use.

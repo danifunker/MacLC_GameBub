@@ -26,7 +26,8 @@ You already run Quartus in WSL, so this follows the same pattern.
    Installer for FPGAs & Adaptive SoCs*, **Linux self-extracting web
    installer** (`FPGAs_AdaptiveSoCs_Unified_<version>_Lin64.bin`), from
    <https://www.xilinx.com/support/download.html>. The framework needs
-   **2023.2 or newer**; take the latest.
+   **2023.2 or newer**. This core is built with **2025.2**. Avoid 2026.1:
+   its free tier needs a license file renewed every year and limits the ILA.
 3. **Install from inside WSL.** On Windows 11, WSLg shows the graphical
    installer:
    ```bash
@@ -45,15 +46,33 @@ You already run Quartus in WSL, so this follows the same pattern.
 4. **Libraries** (Ubuntu): `sudo apt install libtinfo6 libncurses6 libx11-6 libxrender1 libxtst6 libxi6 make`.
    On 22.04/24.04, if Vivado complains about `libtinfo.so.5`, add the
    compatibility symlink AMD documents for your Vivado version.
+   Vivado's scripts force `LC_ALL=en_US.UTF-8` and crash without it:
+   `sudo locale-gen en_US.UTF-8`.
 5. **Put Vivado on your PATH**, adjusting the version and location:
    ```bash
-   echo 'source /tools/Xilinx/Vivado/2025.1/settings64.sh' >> ~/.bashrc
+   echo 'source /tools/Xilinx/2025.2/Vivado/settings64.sh' >> ~/.bashrc
    ```
-   Newer releases install to `/tools/Xilinx/<version>/Vivado/settings64.sh`.
-   Check with `vivado -version`.
+   Check with `vivado -version`. Ubuntu's `.bashrc` stops early in
+   non-interactive shells, so a build started from Windows has to source
+   the file itself:
+   ```bash
+   wsl.exe -d Ubuntu-24.04 --exec bash -lc 'source /tools/Xilinx/2025.2/Vivado/settings64.sh && cd /mnt/c/<path>/MacLC_GameBub && ./mill root.buildCore --target gamebub_rev4'
+   ```
 6. **The framework's other needs:** Python 3.12+ (`sudo apt install python3.12
-   python3.12-venv`, or use `uv`/`pyenv`), a JDK 17 or 21 for Mill/Chisel
-   (`sudo apt install openjdk-21-jdk`), `git`, and `curl`.
+   python3.12-venv`, or use `uv`/`pyenv`), `git`, and `curl`. Mill downloads
+   its own JDK.
+7. **Building from a Windows checkout** (`/mnt/c/...`): mount Windows drives
+   with Linux permissions, or the `mill` launcher cannot `chmod` its files.
+   In `/etc/wsl.conf`:
+   ```ini
+   [automount]
+   options = "metadata,uid=1000,gid=1000"
+   ```
+   then `wsl --shutdown`. The repo's `.gitattributes` checks out LF line
+   endings; also run `git -C framework config core.autocrlf false` and
+   re-checkout the submodule, or `mill` fails with `sh\r: not found`.
+   Don't leave a shell open inside `build/`: Windows then cannot delete the
+   folder and the next build fails.
 
 ## 2. Build the bitstream (on the Vivado machine)
 
@@ -69,16 +88,25 @@ The first run downloads Mill, Scala and Chisel. The command then:
 2. collects every `.v/.sv/.vhdl/.xdc` under `rtl/`;
 3. runs Vivado synthesis, place and route, and bitstream generation.
 
-The result is `build/MacLC-gamebub_rev4/MacLC-gamebub_rev4.bit`. Expect tens
-of minutes. Keep these reports for review:
+The result is `build/MacLC-gamebub_rev4/MacLC-gamebub_rev4.bit`. It takes
+about 45 minutes on an 8-thread laptop with 6 GB for WSL. Keep these
+reports for review:
 * `*.runs/impl_1/*_utilization_placed.rpt`: **block RAM** is the resource to
   watch (see `docs/PORT_PLAN.md`).
 * `*.runs/impl_1/*_timing_summary_routed.rpt`: look for `WNS` ≥ 0 and read the
   I/O section for the SDRAM/SRAM constraints in `rtl/gamebub/maclc.xdc`.
 
+The current build uses 127 of 135 BRAM36 and meets timing (WNS +0.56 ns,
+WHS +0.036 ns).
+
+To publish a build, zip `core.json`, `files.json`, `settings.json` and the
+`.bit` under `cores/danifunker.MacLC/` (never the ROM) as
+`releases/MacLC_GameBub_<yyyymmdd>.zip`.
+
 ## 3. Put it on the Game Bub
 
-On a FAT32 (MBR) microSD card:
+The Game Bub needs firmware **v1.1-beta2 or later** to run cores from the
+card. On a FAT32 microSD card with an MBR partition table:
 
 ```
 /cores/danifunker.MacLC/
@@ -90,8 +118,10 @@ On a FAT32 (MBR) microSD card:
 ```
 
 Disk images go anywhere on the card; the core asks for them when it starts:
-* **Hard Disk**: `.hda`/`.img`/`.vhd`, at most **16 MiB** for now (see
-  PORT_PLAN.md §2b). A PRAM file `<diskname>.nvr` is created next to it.
+* **Hard Disk**: `.hda`/`.img`/`.vhd`, at most **19,398,656 bytes** (18.5 MiB;
+  see PORT_PLAN.md §2b). A PRAM file `<diskname>.nvr` is created next to it.
+  The firmware always asks for one; for floppy-only use pick a small
+  placeholder image.
 * **Floppy Disk**: `.dsk`/`.image` (raw or DiskCopy 4.2), up to 1.44 MB.
   "Floppy Writes" must be on before the Mac can write to it.
 
@@ -131,4 +161,5 @@ See `docs/PORT_PLAN.md` §5. In order of cost:
   alive.
 * **Mac serial port.** PMOD pin 1 is the Mac's modem-port TxD and pin 2 its
   RxD (3.3 V levels).
-* **JTAG + Vivado ILA** through J702 with a Digilent JTAG-HS2.
+* **JTAG + Vivado ILA** through J702 with a Digilent JTAG-HS2. The scripts
+  and the flow are in `scripts/debug/README.md`.
